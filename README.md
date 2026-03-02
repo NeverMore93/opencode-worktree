@@ -46,23 +46,16 @@ Worktrees are stored in `~/.local/share/opencode/worktree/<project-id>/<branch>/
 
 ## Installation
 
-Install via [OCX](https://github.com/kdcokenny/ocx), the package manager for OpenCode extensions:
-
 ```bash
-# Install OCX
-curl -fsSL https://ocx.kdco.dev/install.sh | sh
-
-# Add the registry and install
-ocx registry add https://registry.kdco.dev --name kdco
-ocx add kdco/worktree
+ocx add kdco/worktree --from https://registry.kdco.dev
 ```
 
-> **Tip:** Add `--global` to configure the registry globally instead of per-project.
+If you don't have OCX installed, install it from the [OCX repository](https://github.com/kdcokenny/ocx).
 
-Want the full experience? Install `kdco-workspace` instead—it bundles worktrees with background agents, planning tools, and notifications:
+**Optional:** Install `kdco-workspace` for the full experience—it bundles worktrees with background agents, planning tools, and notifications:
 
 ```bash
-ocx add kdco/workspace
+ocx add kdco/workspace --from https://registry.kdco.dev
 ```
 
 ## Usage
