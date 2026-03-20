@@ -232,6 +232,19 @@ From the [KDCO Registry](https://github.com/kdcokenny/ocx/tree/main/registry/src
 
 Inspired by [opencode-worktree-session](https://github.com/felixAnhalt/opencode-worktree-session) by Felix Anhalt.
 
+## Contributing
+
+This facade is maintained from the main [OCX monorepo](https://github.com/kdcokenny/ocx).
+
+If you want to update opencode-worktree itself, start here:
+
+- https://github.com/kdcokenny/ocx/blob/main/workers/kdco-registry/files/plugins/worktree.ts
+- https://github.com/kdcokenny/ocx/tree/main/workers/kdco-registry/files/plugins/worktree
+
+- Open issues here: https://github.com/kdcokenny/ocx/issues/new
+- Open pull requests here: https://github.com/kdcokenny/ocx/compare
+- Please do **not** open issues or PRs in this facade repository.
+
 ## Disclaimer
 
 This project is not built by the OpenCode team and is not affiliated with [OpenCode](https://github.com/sst/opencode) in any way.
