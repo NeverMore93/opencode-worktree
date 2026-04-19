@@ -31,11 +31,17 @@ if (-not (Test-FeatureBranch -Branch $paths.CURRENT_BRANCH -HasGit $paths.HAS_GI
 # Ensure the feature directory exists
 New-Item -ItemType Directory -Path $paths.FEATURE_DIR -Force | Out-Null
 
-# Copy plan template if it exists, otherwise note it or create empty file
+# Copy plan template if it exists, otherwise note it or create empty file.
+# When running in -Json mode we must not emit any non-JSON chatter on stdout,
+# so human-readable status goes through Write-Verbose / Write-Warning (stderr).
 $template = Resolve-Template -TemplateName 'plan-template' -RepoRoot $paths.REPO_ROOT
-if ($template -and (Test-Path $template)) { 
+if ($template -and (Test-Path $template)) {
     Copy-Item $template $paths.IMPL_PLAN -Force
-    Write-Output "Copied plan template to $($paths.IMPL_PLAN)"
+    if (-not $Json) {
+        Write-Output "Copied plan template to $($paths.IMPL_PLAN)"
+    } else {
+        Write-Verbose "Copied plan template to $($paths.IMPL_PLAN)"
+    }
 } else {
     Write-Warning "Plan template not found"
     # Create a basic plan file if template doesn't exist

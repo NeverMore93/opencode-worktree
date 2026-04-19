@@ -44,8 +44,8 @@ Follow-up TODOs:
 ## Repository Constraints
 
 - This repository is a facade for the OCX monorepo implementation. Shipped code lives under `src/plugin/`; the full build and test workflow lives upstream.
-- Current runtime behavior is the single-repo plugin documented in `README.md` and implemented in `src/plugin/worktree.ts` plus `src/plugin/worktree/`.
-- Active feature work for workspace orchestration MUST keep current behavior truths visible while design documents may describe the target state ahead of implementation.
+- Current runtime behavior includes both the legacy single-repo plugin (`worktree_create`, `worktree_delete`) and multi-repo workspace orchestration (`worktree_workspace_create`, the auto-created `/dev <name>` slash command), all implemented in `src/plugin/worktree.ts` plus `src/plugin/worktree/`.
+- Active feature work MUST update this constitution alongside the relevant spec change; behaviour claims here are the pre-feature baseline only when explicitly labelled as such.
 
 ## Workflow and Review Gates
 

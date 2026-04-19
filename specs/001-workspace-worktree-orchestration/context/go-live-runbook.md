@@ -21,8 +21,9 @@ All scenarios assume the plugin is loaded by OpenCode in a directory that contai
 ```bash
 mkdir -p /tmp/wtree-smoke/repos
 cd /tmp/wtree-smoke/repos
-git init repoA && (cd repoA && git commit --allow-empty -m init)
-git init repoB && (cd repoB && git commit --allow-empty -m init)
+# Force main branch + set identity so commit --allow-empty succeeds regardless of global git config
+git init -b main repoA && (cd repoA && git -c user.email=smoke@test -c user.name=smoke commit --allow-empty -m init)
+git init -b main repoB && (cd repoB && git -c user.email=smoke@test -c user.name=smoke commit --allow-empty -m init)
 cd /tmp/wtree-smoke/repos
 opencode   # loads plugin via .opencode/plugin symlink, etc.
 ```

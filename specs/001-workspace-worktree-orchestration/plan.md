@@ -193,9 +193,10 @@ Workspace membership is reconstructed by: (1) auto-detecting repos in `<cwd>`, (
 | Export | Signature | Notes |
 |--------|-----------|-------|
 | `MemberStatus` | `'created' \| 'reused' \| 'retried' \| 'failed'` | |
-| `MemberOutcome` | `{ repoName, worktreePath, branch, status, error? }` | FR-019 per-repo |
+| `MemberOutcome` | `{ name, worktreePath, branch, status, error? }` | FR-019 per-repo |
 | `WorkspaceCreateResult` | `{ workspacePath, sessionId, sessionDisposition, repos[], warnings[] }` | FR-019 |
-| `checkBranchCollisions` | `(repos[], plans[]) => Result<void, CollisionError>` | FR-009 pre-check |
+| `PreCheckOutcome` | `{ collisions: CollisionError[], preCheckFailures: PreCheckFailure[] }` | FR-009 dual-path |
+| `checkBranchCollisions` | `(plans[], workspacePath) => Promise<PreCheckOutcome>` | FR-009 pre-check (confirmed collisions + per-repo failures) |
 | `planRepoWorktrees` | `(target, existingMembers) => RepoWorktreePlan[]` | Classify actions |
 | `executeWorktreeCreation` | `(target, plans[], configs) => Promise<MemberOutcome[]>` | FR-007 parallel |
 | `orchestrateWorkspaceCreate` | `(ctx, name, client) => Promise<WorkspaceCreateResult>` | Top-level entry |

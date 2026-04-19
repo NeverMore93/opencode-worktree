@@ -8,17 +8,16 @@
 
 ## Current Shipped Behavior
 
-- The current runtime exposes only `worktree_create` and `worktree_delete`.
-- `worktree_create` currently assumes a single repo rooted at `ctx.directory`.
-- The current worktree path formula is `${HOME}/.local/share/opencode/worktree/<projectId>/<branch>`.
-- The current plugin-owned SQLite path formula is `${HOME}/.local/share/opencode/plugins/worktree/<projectId>.sqlite`.
-- The current SQLite tables are:
-  - `sessions`
-  - singleton `pending_operations`
-- `worktree_delete` is deferred:
-  - it first records a pending delete
-  - actual cleanup runs on `session.idle`
-  - cleanup runs hooks, commits a snapshot, removes the worktree, and clears plugin state
+- The runtime exposes three tools: `worktree_create`, `worktree_delete`, and `worktree_workspace_create`.
+- `worktree_create` supports single-repo mode with `repoPath` and `headless` parameters (FR-005/FR-006/FR-020). Legacy interactive terminal-and-fork path is preserved.
+- `worktree_workspace_create` (plus the auto-created `/dev <name>` slash command per FR-024) auto-detects git repos in `<cwd>`, creates a mirrored worktree layout under `<cwd>/../worktrees/<name>/`, runs per-repo sync and hooks in parallel, forks exactly one workspace-level session (always headless), and returns `WorkspaceCreateResult { workspacePath, sessionId, sessionDisposition, repos[], warnings[] }`.
+- The worktree path formula for single-repo legacy mode is `${HOME}/.local/share/opencode/worktree/<projectId>/<branch>`. Workspace mode uses `<cwd>/../worktrees/<name>/<repo>/`.
+- The plugin-owned SQLite path formula is `${HOME}/.local/share/opencode/plugins/worktree/<projectId>.sqlite`.
+- The SQLite tables are:
+  - `sessions` and singleton `pending_operations` (legacy single-repo)
+  - `workspace_associations` and `workspace_members` (workspace mode, per-project DB; FR-021)
+- The state module manages a DB pool keyed by projectId with graceful cleanup on SIGINT/SIGTERM/beforeExit.
+- `worktree_delete` is deferred: it records a pending delete and actual cleanup runs on `session.idle` (hooks, snapshot commit, worktree remove, state clear).
 
 ## Context Discipline
 

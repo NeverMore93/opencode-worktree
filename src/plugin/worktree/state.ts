@@ -151,7 +151,7 @@ function registerPoolCleanupHandlers(): void {
 	if (poolCleanupRegistered) return
 	poolCleanupRegistered = true
 
-	const cleanup = () => {
+	const cleanup = (signal?: NodeJS.Signals) => {
 		for (const [projectId, database] of dbPool) {
 			try {
 				database.exec("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -161,11 +161,18 @@ function registerPoolCleanupHandlers(): void {
 			}
 			dbPool.delete(projectId)
 		}
+		// Re-raise the signal so the process actually terminates. `once`
+		// already removed our handler, so the second delivery hits Node's
+		// default action (exit with signal code). Without this the event
+		// loop may keep the process alive after cleanup and Ctrl+C hangs.
+		if (signal === "SIGINT" || signal === "SIGTERM") {
+			process.kill(process.pid, signal)
+		}
 	}
 
-	process.once("SIGTERM", cleanup)
-	process.once("SIGINT", cleanup)
-	process.once("beforeExit", cleanup)
+	process.once("SIGTERM", () => cleanup("SIGTERM"))
+	process.once("SIGINT", () => cleanup("SIGINT"))
+	process.once("beforeExit", () => cleanup())
 }
 
 /**

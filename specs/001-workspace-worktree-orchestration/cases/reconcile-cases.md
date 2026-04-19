@@ -27,10 +27,10 @@ Note: `mismatch` status was removed from MVP scope.
 ## Branch Name Computation
 
 - First creation: `dev_{base_branch}_{name}_{YYMMDD}`
-- `/` in `base_branch` is replaced by `-` (e.g., `feature/login` -> `feature-login`)
-- Detached HEAD: `base_branch` = abbreviated commit SHA (first 8 characters)
-- Stored branch name is reused verbatim on re-run; date does not re-roll
-- If stored branch was manually deleted: recreated via `git worktree add -b`
+- `base_branch` is the local short HEAD name from `git rev-parse --abbrev-ref HEAD`, preserved as-is. Slashes in names like `feature/login` are NOT substituted — the iteration-2 `/`→`-` rule was removed in spec Part 3 (2026-04-17).
+- Detached HEAD: `base_branch` = first 12 hex characters of commit SHA (extended from 8 chars in spec Part 3 for collision resistance in large monorepos).
+- Stored branch name is reused verbatim on re-run; date does not re-roll.
+- If stored branch was manually deleted: recreated via `git worktree add -b`.
 
 ## Session Outcomes
 

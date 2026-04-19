@@ -20,7 +20,14 @@ if (-not $DestRoot) {
     if ($env:CODEX_HOME) {
         $DestRoot = Join-Path $env:CODEX_HOME "skills"
     } else {
-        $DestRoot = Join-Path $env:USERPROFILE ".codex/skills"
+        # Prefer $HOME (PowerShell Core sets it on all platforms and it's the
+        # documented convention on Linux/macOS). Fall back to USERPROFILE on
+        # older Windows PowerShell where $HOME may not be populated.
+        $userHome = if ($HOME) { $HOME } else { $env:USERPROFILE }
+        if (-not $userHome) {
+            throw "Cannot determine user home directory. Set `$CODEX_HOME explicitly or ensure `$HOME or `$USERPROFILE is available."
+        }
+        $DestRoot = Join-Path $userHome ".codex/skills"
     }
 }
 

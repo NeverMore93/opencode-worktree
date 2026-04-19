@@ -749,6 +749,13 @@ export async function orchestrateWorkspaceCreate(
 		}
 
 		// ── Step 5: Load existing members from per-project DBs ──────────
+		// Fail-fast on DB init failure. If we silently skipped a repo whose
+		// state DB couldn't be opened, its existing members would be missing
+		// from `existingMembers`; `planRepoWorktrees` would then classify
+		// the still-present worktree directory as an orphan, and
+		// `executeSingleRepo` would `rm -rf` the worktree — destroying the
+		// previous reconcile including any uncommitted work. Fail now so
+		// the caller can retry; no filesystem mutation has happened yet.
 		const existingMembers = new Map<string, WorkspaceMember>()
 		for (const repo of target.repos) {
 			try {
@@ -757,9 +764,12 @@ export async function orchestrateWorkspaceCreate(
 				for (const member of members) {
 					existingMembers.set(member.projectId, member)
 				}
-			} catch {
-				// DB init failure for one repo shouldn't block others
-				log.warn(`[workspace] Failed to load existing members for ${repo.name}`)
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error)
+				return R.err(
+					`Failed to open state DB for ${repo.name} (projectId=${repo.projectId}): ${message}. ` +
+						`No mutations have been performed — re-run to retry.`,
+				)
 			}
 		}
 
