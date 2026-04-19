@@ -6,6 +6,8 @@
  *
  * Database location: ~/.local/share/opencode/plugins/worktree/{project-id}.sqlite
  * Project ID is the first git root commit SHA (40-char hex), with SHA-256 path hash fallback (16-char).
+ *
+ * Supports a pooled lifecycle: multiple databases can be open simultaneously, keyed by projectId.
  */
 
 import { Database } from "bun:sqlite"
@@ -18,7 +20,7 @@ import { getProjectId, logWarn } from "../kdco-primitives"
 import { parsePersistedLaunchMetadata, serializePersistedLaunchMetadata } from "./launch-context"
 
 // =============================================================================
-// TYPES
+// TYPES — Sessions (existing)
 // =============================================================================
 
 /** Represents an active worktree session */
@@ -52,7 +54,29 @@ export interface PendingDelete {
 }
 
 // =============================================================================
-// SCHEMAS (Boundary Validation)
+// TYPES — Workspace (new)
+// =============================================================================
+
+/** Workspace association identity + session binding (per-project DB) */
+export type WorkspaceAssociation = z.infer<typeof workspaceAssociationSchema>
+
+/** Input for upserting a workspace association */
+export type WorkspaceAssociationInput = Omit<WorkspaceAssociation, "createdAt" | "updatedAt"> & {
+	createdAt?: string
+	updatedAt?: string
+}
+
+/** Workspace member per-repo worktree record (per-project DB) */
+export type WorkspaceMember = z.infer<typeof workspaceMemberSchema>
+
+/** Input for upserting a workspace member */
+export type WorkspaceMemberInput = Omit<WorkspaceMember, "createdAt" | "updatedAt"> & {
+	createdAt?: string
+	updatedAt?: string
+}
+
+// =============================================================================
+// SCHEMAS — Sessions (existing, Boundary Validation)
 // =============================================================================
 
 const sessionSchema = z.object({
@@ -75,6 +99,140 @@ const pendingDeleteSchema = z.object({
 	branch: z.string().min(1),
 	path: z.string().min(1),
 })
+
+// =============================================================================
+// SCHEMAS — Workspace (new, Boundary Validation)
+// =============================================================================
+
+const workspaceAssociationSchema = z.object({
+	name: z.string().min(1),
+	workspacePath: z.string().min(1),
+	sessionId: z.string().nullable(),
+	sessionDisposition: z.string().nullable(),
+	sourceCwd: z.string().min(1),
+	createdAt: z.string().min(1),
+	updatedAt: z.string().min(1),
+})
+
+const workspaceMemberSchema = z.object({
+	workspaceName: z.string().min(1),
+	workspacePath: z.string().min(1),
+	repoName: z.string().min(1),
+	projectId: z.string().min(1),
+	branch: z.string().min(1),
+	worktreePath: z.string().min(1),
+	status: z.enum(["created", "reused", "retried", "failed"]),
+	error: z.string().nullable(),
+	createdAt: z.string().min(1),
+	updatedAt: z.string().min(1),
+})
+
+// Re-export schemas for external use
+export { workspaceAssociationSchema, workspaceMemberSchema }
+
+// =============================================================================
+// DATABASE POOL
+// =============================================================================
+
+/**
+ * Module-level pool: one Database instance per projectId.
+ * Replaces the former module-level singleton pattern.
+ */
+const dbPool: Map<string, Database> = new Map()
+
+/** Flag to prevent duplicate cleanup handler registration */
+let poolCleanupRegistered = false
+
+/**
+ * Register process cleanup handlers for graceful shutdown of ALL pooled databases.
+ * Ensures WAL checkpoint and proper close on process termination.
+ */
+function registerPoolCleanupHandlers(): void {
+	if (poolCleanupRegistered) return
+	poolCleanupRegistered = true
+
+	const cleanup = () => {
+		for (const [projectId, database] of dbPool) {
+			try {
+				database.exec("PRAGMA wal_checkpoint(TRUNCATE)")
+				database.close()
+			} catch {
+				// Best effort cleanup — process is exiting anyway
+			}
+			dbPool.delete(projectId)
+		}
+	}
+
+	process.once("SIGTERM", cleanup)
+	process.once("SIGINT", cleanup)
+	process.once("beforeExit", cleanup)
+}
+
+/**
+ * Look up an already-open database by projectId.
+ *
+ * @param projectId - The project identifier (git root commit SHA or path hash)
+ * @returns Database instance if already in the pool, null otherwise
+ */
+export function getDb(projectId: string): Database | null {
+	return dbPool.get(projectId) ?? null
+}
+
+/**
+ * Get an existing pooled database or initialize a new one on demand.
+ *
+ * @param projectId - The project identifier
+ * @param projectRoot - Absolute path to the project root (needed for DB path resolution)
+ * @param client - Optional OpencodeClient for logging
+ * @returns Configured Database instance
+ */
+export async function getOrInitDb(
+	projectId: string,
+	projectRoot: string,
+	client?: OpencodeClient,
+): Promise<Database> {
+	const existing = dbPool.get(projectId)
+	if (existing) return existing
+
+	// initStateDb computes its own projectId from projectRoot and registers
+	// under that key. We trust its keying — do not double-register under a
+	// potentially different projectId from the caller.
+	const db = await initStateDb(projectRoot)
+	return db
+}
+
+/**
+ * Close and remove a specific database from the pool.
+ *
+ * @param projectId - The project identifier to close
+ */
+export function closeDb(projectId: string): void {
+	const database = dbPool.get(projectId)
+	if (!database) return
+
+	try {
+		database.exec("PRAGMA wal_checkpoint(TRUNCATE)")
+		database.close()
+	} catch {
+		// Best effort
+	}
+	dbPool.delete(projectId)
+}
+
+/**
+ * Close all pooled databases. Useful for tests or controlled shutdown.
+ */
+export function closeAllDbs(): void {
+	for (const [projectId, database] of dbPool) {
+		try {
+			database.exec("PRAGMA wal_checkpoint(TRUNCATE)")
+			database.close()
+		} catch {
+			// Best effort
+		}
+		dbPool.delete(projectId)
+	}
+}
 
 // =============================================================================
 // DATABASE UTILITIES
@@ -129,6 +287,7 @@ async function getDbPath(projectRoot: string): Promise<string> {
 /**
  * Initialize the SQLite database for worktree state.
  * Creates the database file and schema if they don't exist.
+ * Registers the instance in the module-level pool keyed by projectId.
  *
  * @param projectRoot - Absolute path to the project root
  * @returns Configured Database instance
@@ -146,6 +305,13 @@ export async function initStateDb(projectRoot: string): Promise<Database> {
 		throw new Error("initStateDb requires a valid project root path")
 	}
 
+	// Resolve projectId for pool keying
+	const projectId = await getProjectId(projectRoot)
+
+	// Return existing pooled instance if available
+	const existing = dbPool.get(projectId)
+	if (existing) return existing
+
 	const dbPath = await getDbPath(projectRoot)
 	const dbDir = path.dirname(dbPath)
 
@@ -159,7 +325,8 @@ export async function initStateDb(projectRoot: string): Promise<Database> {
 	db.exec("PRAGMA journal_mode=WAL")
 	db.exec("PRAGMA busy_timeout=5000")
 
-	// Create tables with schema
+	// --- Existing tables ---
+
 	db.exec(`
 		CREATE TABLE IF NOT EXISTS sessions (
 			id TEXT PRIMARY KEY,
@@ -183,6 +350,41 @@ export async function initStateDb(projectRoot: string): Promise<Database> {
 			session_id TEXT
 		)
 	`)
+
+	// --- New workspace tables (T005) ---
+
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS workspace_associations (
+			name TEXT NOT NULL,
+			workspace_path TEXT NOT NULL,
+			session_id TEXT,
+			session_disposition TEXT,
+			source_cwd TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (name, workspace_path)
+		)
+	`)
+
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS workspace_members (
+			workspace_name TEXT NOT NULL,
+			workspace_path TEXT NOT NULL,
+			repo_name TEXT NOT NULL,
+			project_id TEXT NOT NULL,
+			branch TEXT NOT NULL,
+			worktree_path TEXT NOT NULL,
+			status TEXT NOT NULL,
+			error TEXT,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (workspace_name, workspace_path, project_id)
+		)
+	`)
+
+	// Add to pool and register cleanup
+	dbPool.set(projectId, db)
+	registerPoolCleanupHandlers()
 
 	return db
 }
@@ -499,4 +701,256 @@ export function getPendingDelete(db: Database): PendingDelete | null {
 export function clearPendingDelete(db: Database): void {
 	const stmt = db.prepare(`DELETE FROM pending_operations WHERE id = 1 AND type = 'delete'`)
 	stmt.run()
+}
+
+// =============================================================================
+// WORKSPACE ASSOCIATION CRUD
+// =============================================================================
+
+/**
+ * Upsert a workspace association record.
+ * Uses INSERT OR REPLACE keyed on (name, workspace_path).
+ *
+ * @param db - Database instance from initStateDb
+ * @param assoc - Workspace association input data
+ */
+export function upsertWorkspaceAssociation(
+	db: Database,
+	assoc: WorkspaceAssociationInput,
+): void {
+	const now = new Date().toISOString()
+	const parsed = workspaceAssociationSchema.parse({
+		...assoc,
+		sessionId: assoc.sessionId ?? null,
+		sessionDisposition: assoc.sessionDisposition ?? null,
+		createdAt: assoc.createdAt ?? now,
+		updatedAt: assoc.updatedAt ?? now,
+	})
+
+	const stmt = db.prepare(`
+		INSERT INTO workspace_associations
+			(name, workspace_path, session_id, session_disposition, source_cwd, created_at, updated_at)
+		VALUES ($name, $workspacePath, $sessionId, $sessionDisposition, $sourceCwd, $createdAt, $updatedAt)
+		ON CONFLICT (name, workspace_path) DO UPDATE SET
+			session_id = excluded.session_id,
+			session_disposition = excluded.session_disposition,
+			source_cwd = excluded.source_cwd,
+			updated_at = excluded.updated_at
+	`)
+
+	stmt.run({
+		$name: parsed.name,
+		$workspacePath: parsed.workspacePath,
+		$sessionId: parsed.sessionId,
+		$sessionDisposition: parsed.sessionDisposition,
+		$sourceCwd: parsed.sourceCwd,
+		$createdAt: parsed.createdAt,
+		$updatedAt: parsed.updatedAt,
+	})
+}
+
+/**
+ * Get a workspace association by name and workspace path.
+ *
+ * @param db - Database instance from initStateDb
+ * @param name - Workspace name (/dev <name> argument)
+ * @param workspacePath - Normalized absolute target path
+ * @returns WorkspaceAssociation if found, null otherwise
+ */
+export function getWorkspaceAssociation(
+	db: Database,
+	name: string,
+	workspacePath: string,
+): WorkspaceAssociation | null {
+	if (!name || !workspacePath) return null
+
+	const stmt = db.prepare(`
+		SELECT
+			name,
+			workspace_path AS workspacePath,
+			session_id AS sessionId,
+			session_disposition AS sessionDisposition,
+			source_cwd AS sourceCwd,
+			created_at AS createdAt,
+			updated_at AS updatedAt
+		FROM workspace_associations
+		WHERE name = $name AND workspace_path = $workspacePath
+	`)
+
+	const row = stmt.get({ $name: name, $workspacePath: workspacePath }) as Record<string, string | null> | null
+	if (!row) return null
+
+	return workspaceAssociationSchema.parse(row)
+}
+
+/**
+ * Update the session binding on a workspace association.
+ *
+ * @param db - Database instance from initStateDb
+ * @param name - Workspace name
+ * @param workspacePath - Workspace path
+ * @param sessionId - Session ID to bind
+ * @param disposition - Session disposition ('forked' or 'reused')
+ */
+export function updateWorkspaceSession(
+	db: Database,
+	name: string,
+	workspacePath: string,
+	sessionId: string,
+	disposition: string,
+): void {
+	if (!name || !workspacePath || !sessionId || !disposition) {
+		throw new Error("updateWorkspaceSession requires all parameters to be non-empty")
+	}
+
+	const now = new Date().toISOString()
+
+	const stmt = db.prepare(`
+		UPDATE workspace_associations
+		SET session_id = $sessionId,
+			session_disposition = $disposition,
+			updated_at = $updatedAt
+		WHERE name = $name AND workspace_path = $workspacePath
+	`)
+
+	stmt.run({
+		$name: name,
+		$workspacePath: workspacePath,
+		$sessionId: sessionId,
+		$disposition: disposition,
+		$updatedAt: now,
+	})
+}
+
+// =============================================================================
+// WORKSPACE MEMBER CRUD
+// =============================================================================
+
+/**
+ * Upsert a workspace member record.
+ * Uses INSERT OR REPLACE keyed on (workspace_name, workspace_path, project_id).
+ *
+ * @param db - Database instance from initStateDb
+ * @param member - Workspace member input data
+ */
+export function upsertWorkspaceMember(db: Database, member: WorkspaceMemberInput): void {
+	const now = new Date().toISOString()
+	const parsed = workspaceMemberSchema.parse({
+		...member,
+		error: member.error ?? null,
+		createdAt: member.createdAt ?? now,
+		updatedAt: member.updatedAt ?? now,
+	})
+
+	const stmt = db.prepare(`
+		INSERT INTO workspace_members
+			(workspace_name, workspace_path, repo_name, project_id, branch, worktree_path, status, error, created_at, updated_at)
+		VALUES ($workspaceName, $workspacePath, $repoName, $projectId, $branch, $worktreePath, $status, $error, $createdAt, $updatedAt)
+		ON CONFLICT (workspace_name, workspace_path, project_id) DO UPDATE SET
+			repo_name = excluded.repo_name,
+			branch = excluded.branch,
+			worktree_path = excluded.worktree_path,
+			status = excluded.status,
+			error = excluded.error,
+			updated_at = excluded.updated_at
+	`)
+
+	stmt.run({
+		$workspaceName: parsed.workspaceName,
+		$workspacePath: parsed.workspacePath,
+		$repoName: parsed.repoName,
+		$projectId: parsed.projectId,
+		$branch: parsed.branch,
+		$worktreePath: parsed.worktreePath,
+		$status: parsed.status,
+		$error: parsed.error,
+		$createdAt: parsed.createdAt,
+		$updatedAt: parsed.updatedAt,
+	})
+}
+
+/**
+ * Get all workspace members for a workspace.
+ *
+ * @param db - Database instance from initStateDb
+ * @param workspaceName - Workspace name
+ * @param workspacePath - Workspace path
+ * @returns Array of workspace members, empty if none
+ */
+export function getWorkspaceMembers(
+	db: Database,
+	workspaceName: string,
+	workspacePath: string,
+): WorkspaceMember[] {
+	if (!workspaceName || !workspacePath) return []
+
+	const stmt = db.prepare(`
+		SELECT
+			workspace_name AS workspaceName,
+			workspace_path AS workspacePath,
+			repo_name AS repoName,
+			project_id AS projectId,
+			branch,
+			worktree_path AS worktreePath,
+			status,
+			error,
+			created_at AS createdAt,
+			updated_at AS updatedAt
+		FROM workspace_members
+		WHERE workspace_name = $workspaceName AND workspace_path = $workspacePath
+		ORDER BY created_at ASC
+	`)
+
+	const rows = stmt.all({
+		$workspaceName: workspaceName,
+		$workspacePath: workspacePath,
+	}) as Array<Record<string, string | null>>
+
+	return rows.map((row) => workspaceMemberSchema.parse(row))
+}
+
+/**
+ * Get a single workspace member by workspace identity and project ID.
+ *
+ * @param db - Database instance from initStateDb
+ * @param workspaceName - Workspace name
+ * @param workspacePath - Workspace path
+ * @param projectId - Project ID of the repo
+ * @returns WorkspaceMember if found, null otherwise
+ */
+export function getWorkspaceMember(
+	db: Database,
+	workspaceName: string,
+	workspacePath: string,
+	projectId: string,
+): WorkspaceMember | null {
+	if (!workspaceName || !workspacePath || !projectId) return null
+
+	const stmt = db.prepare(`
+		SELECT
+			workspace_name AS workspaceName,
+			workspace_path AS workspacePath,
+			repo_name AS repoName,
+			project_id AS projectId,
+			branch,
+			worktree_path AS worktreePath,
+			status,
+			error,
+			created_at AS createdAt,
+			updated_at AS updatedAt
+		FROM workspace_members
+		WHERE workspace_name = $workspaceName
+			AND workspace_path = $workspacePath
+			AND project_id = $projectId
+	`)
+
+	const row = stmt.get({
+		$workspaceName: workspaceName,
+		$workspacePath: workspacePath,
+		$projectId: projectId,
+	}) as Record<string, string | null> | null
+
+	if (!row) return null
+
+	return workspaceMemberSchema.parse(row)
 }

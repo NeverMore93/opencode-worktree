@@ -1,8 +1,8 @@
 # opencode-worktree
 
-> Git worktrees that spawn their own terminal. Zero-friction isolation for AI-driven development.
+> Git worktrees that spawn their own terminal. Multi-repo workspaces that orchestrate themselves. Zero-friction isolation for AI-driven development.
 
-An [OpenCode](https://github.com/sst/opencode) plugin that creates isolated git worktrees—where each worktree automatically opens its own terminal with OpenCode running inside. No manual setup, no context switching, no cleanup work.
+An [OpenCode](https://github.com/sst/opencode) plugin that creates isolated git worktrees—single-repo with automatic terminal spawning, or multi-repo workspaces that mirror your directory layout. No manual setup, no context switching, no cleanup work.
 
 ## Why This Exists
 
@@ -10,7 +10,7 @@ You already know you can create git worktrees manually. Or use OpenCode Desktop'
 
 Manual worktrees require setup: create the worktree, open a terminal, navigate to it, start OpenCode. OpenCode Desktop gives you worktrees, but locks you into the GUI workflow. Each approach has friction.
 
-This plugin eliminates that friction. When the AI calls `worktree_create`, your terminal spawns automatically, OpenCode is already running, and files are synchronized. When it calls `worktree_delete`, changes commit automatically and the worktree cleans itself up. It's the difference between having a tool and having a workflow.
+This plugin eliminates that friction. When the AI calls `worktree_create`, your terminal spawns automatically, OpenCode is already running, and files are synchronized. When it calls `worktree_delete`, changes commit automatically and the worktree cleans itself up. For multi-repo setups, `/dev my-feature` creates parallel worktrees across all detected repos, syncs and hooks each one, then returns a session ID for the caller to connect however it chooses. It's the difference between having a tool and having a workflow.
 
 Works great standalone, but pairs especially well with **[cmux](https://www.cmux.dev/)** for agentic workflows. cmux provides native workspace management and programmatic control that fits naturally into automated development workflows. tmux is also supported if you prefer a traditional multiplexer setup.
 
@@ -26,23 +26,42 @@ If you prefer manual control or work exclusively in OpenCode Desktop, you may no
 
 ## How It Works
 
+### Single-Repo Worktrees
+
 ```mermaid
 flowchart LR
-    A[Create Worktree] --> B{Terminal Spawns}
+    A[worktree_create] --> B{Terminal Spawns}
     B --> C[OpenCode Running]
     C --> D[Work in Isolation]
-    D --> E[Delete Worktree]
+    D --> E[worktree_delete]
     E --> F{Auto-commit & Cleanup}
     F --> G[Session Ends]
 ```
 
-1. **Create** - AI calls `worktree_create("feature/dark-mode")`
-2. **Terminal spawns** - New window opens with OpenCode at `~/.local/share/opencode/worktree/<project-id>/feature/dark-mode`
-3. **Work** - AI experiments in complete isolation
-4. **Delete** - AI calls `worktree_delete("reason")`
-5. **Cleanup** - Changes commit automatically, git worktree removed
+1. **Create** — AI calls `worktree_create("feature/dark-mode")`
+2. **Terminal spawns** — New window opens with OpenCode at `~/.local/share/opencode/worktree/<project-id>/feature/dark-mode`
+3. **Work** — AI experiments in complete isolation
+4. **Delete** — AI calls `worktree_delete("reason")`
+5. **Cleanup** — Changes commit automatically, git worktree removed
 
-Worktrees are stored in `~/.local/share/opencode/worktree/<project-id>/<branch>/` outside your repository.
+Single-repo worktrees are stored in `~/.local/share/opencode/worktree/<project-id>/<branch>/` outside your repository.
+
+### Multi-Repo Workspaces
+
+```mermaid
+flowchart LR
+    A["/dev my-feature"] --> B[Auto-detect repos]
+    B --> C[Create worktrees in parallel]
+    C --> D[Sync + hooks per repo]
+    D --> E[Fork session]
+    E --> F[Return sessionId + status]
+```
+
+1. **Create** — User runs `/dev my-feature` or AI calls `worktree_workspace_create("my-feature")`
+2. **Detect** — Scans direct subdirectories of cwd for git repos
+3. **Worktrees** — Creates one worktree per repo at `<cwd>/../worktrees/my-feature/<repo>/`
+4. **Session** — Forks a single workspace-level session; returns `sessionId`
+5. **Reconcile** — Re-running the same command reuses healthy worktrees and retries failed ones
 
 ## Installation
 
@@ -60,14 +79,15 @@ ocx add kdco/workspace --from https://registry.kdco.dev
 
 ## Usage
 
-The plugin adds two tools:
+The plugin provides three tools:
 
 | Tool | Purpose |
 |------|---------|
-| `worktree_create(branch, baseBranch?)` | Create a new git worktree for isolated development. A new terminal spawns with OpenCode ready. |
+| `worktree_create(branch, baseBranch?)` | Create a single-repo git worktree with automatic terminal spawning. |
 | `worktree_delete(reason)` | Delete the current worktree. Changes commit automatically before removal. |
+| `worktree_workspace_create(name)` | Create a multi-repo workspace with mirrored worktrees. Headless — no terminal spawned. |
 
-### Creating a Worktree
+### Creating a Single-Repo Worktree
 
 ```yaml
 worktree_create:
@@ -79,7 +99,7 @@ When called, this:
 1. Creates git worktree at `~/.local/share/opencode/worktree/<project-id>/feature/dark-mode`
 2. Syncs files based on `.opencode/worktree.jsonc` config
 3. Runs post-create hooks (e.g., `pnpm install`)
-4. Opens a new terminal with OpenCode running
+4. Forks the current session and opens a new terminal with OpenCode running
 
 ### Deleting a Worktree
 
@@ -93,6 +113,52 @@ When called, this:
 2. Commits all changes with snapshot message
 3. Removes git worktree with `--force`
 4. Cleans up session state
+
+### Creating a Multi-Repo Workspace
+
+For monorepo-like setups where multiple git repositories live under a single parent directory, use the workspace tool:
+
+```yaml
+worktree_workspace_create:
+  name: "my-feature"
+```
+
+Or via the `/dev` slash command:
+
+```
+/dev my-feature
+```
+
+When called, this:
+1. Auto-detects all git repositories in the current directory
+2. Creates worktrees under `<cwd>/../worktrees/<name>/` — one per repo
+3. Computes branch names as `dev_{baseBranch}_{name}_{YYMMDD}` (e.g., `dev_main_my-feature_260415`)
+4. Runs per-repo sync (copyFiles, symlinkDirs) and postCreate hooks in parallel
+5. Forks a single workspace-level session
+6. Returns a structured result — no terminal is opened
+
+**Headless by design:** The workspace tool returns a `sessionId` and per-repo status. The caller (AI agent, slash command, or script) decides how to connect — via `opencode session attach`, a new terminal, or programmatic control.
+
+**Reconcile on re-run:** Running `/dev my-feature` again reconciles rather than rebuilds. Healthy worktrees are reused, missing or failed ones are recreated.
+
+#### Response Shape
+
+```json
+{
+  "workspacePath": "/home/user/worktrees/my-feature",
+  "sessionId": "sess_abc123",
+  "sessionDisposition": "forked",
+  "repos": [
+    { "repoName": "frontend", "worktreePath": "/home/user/worktrees/my-feature/frontend", "branch": "dev_main_my-feature_260415", "status": "created" },
+    { "repoName": "backend", "worktreePath": "/home/user/worktrees/my-feature/backend", "branch": "dev_main_my-feature_260415", "status": "created" }
+  ],
+  "warnings": []
+}
+```
+
+Possible `status` values per repo: `created`, `reused`, `retried`, `failed`.
+
+`sessionDisposition` is either `"forked"` (new session) or `"reused"` (existing session found from a previous run).
 
 ## Platform Support
 
@@ -123,6 +189,9 @@ Auto-creates `.opencode/worktree.jsonc` on first use:
 {
   "$schema": "https://registry.kdco.dev/schemas/worktree.json",
 
+  // This config applies to both worktree_create and workspace mode.
+  // In workspace mode, each repo loads its own .opencode/worktree.jsonc.
+
   "sync": {
     // Files to copy from main worktree
     "copyFiles": [],
@@ -135,11 +204,14 @@ Auto-creates `.opencode/worktree.jsonc` on first use:
   },
 
   "hooks": {
-    // Run after creation
+    // Run after creation (in workspace mode, hooks run in parallel across repos)
     "postCreate": [],
 
-    // Run before deletion
-    "preDelete": []
+    // Run before deletion (single-repo only)
+    "preDelete": [],
+
+    // Timeout per hook command in ms (default: 1800000 = 30 min, 0 = no timeout)
+    // "timeout": 1800000
   }
 }
 ```
