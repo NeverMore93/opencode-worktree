@@ -254,9 +254,15 @@ export async function checkBranchCollisions(
 	// Normalize workspacePath for reliable prefix comparison
 	const normalizedWorkspace = path.resolve(workspacePath)
 
-	// Only check plans that will actually create or re-create worktrees.
-	// "reuse" plans already have a healthy worktree at the expected path.
-	const plansToCheck = plans.filter((p) => p.action === "create" || p.action === "retry")
+	// Check ALL plans, including `reuse`. Reuse plans originating from the
+	// orphan-adoption path (planRepoWorktrees' no-DB-record branch) can carry
+	// a branch name that is ALSO checked out at an external worktree (e.g.
+	// the user's `main` in the source repo). Dropping reuse plans here would
+	// silently let the workspace share a branch with a live external checkout,
+	// which is exactly what FR-009 is designed to prevent. Entries whose path
+	// is inside `normalizedWorkspace` are filtered inside the loop, so the
+	// self-match for an adopted (or existing-member) reuse plan is harmless.
+	const plansToCheck = plans
 
 	// Collect all worktree entries per unique repo root (dedup in case
 	// multiple plans reference the same repo root — shouldn't happen but
@@ -417,7 +423,9 @@ export async function planRepoWorktrees(
 		const existing = existingMembers.get(repo.projectId)
 
 		if (existing) {
-			// Existing member record — check health to decide reuse vs retry
+			// Existing member record — authoritative path is existing.worktreePath
+			// (not the recomputed one). If the workspace was moved or repo naming
+			// shifted between runs, the old location is what we provably own.
 			const healthy = await isWorktreeHealthy(existing.worktreePath, repo.path)
 
 			if (healthy && existing.status !== "failed") {
@@ -429,20 +437,32 @@ export async function planRepoWorktrees(
 					action: "reuse",
 					isOrphan: false,
 				})
+			} else if (healthy) {
+				// Healthy worktree, but last run's sync or hooks failed (so we
+				// stored status="failed"). The worktree itself is intact and may
+				// hold user work-in-progress between runs — we MUST NOT rm or
+				// re-add it. Plan a retry that only re-runs sync+hooks.
+				// executeSingleRepo short-circuits the `git worktree add` step
+				// when retry + !isOrphan + worktree is still healthy at exec time.
+				plans.push({
+					repo,
+					branch: existing.branch,
+					worktreePath: existing.worktreePath,
+					action: "retry",
+					isOrphan: false,
+				})
 			} else {
-				// Unhealthy or previously failed → retry with stored branch name.
-				// If a directory still exists at `worktreePath`, it's a stale
-				// artifact from our previous failed run — the DB member record
-				// proves we own this path, so it's safe to rm before retrying.
-				// Without this cleanup, `git worktree add` aborts with
-				// `'<path>' already exists` (which doesn't match the
-				// stale-metadata prune-and-retry heuristics), the repo is
-				// permanently stuck in "failed", and planning never re-enters
-				// the adoption branch (that branch only fires when there is
-				// NO member record).
+				// Unhealthy worktree → the directory, if present, is a stale
+				// artifact from a previously failed `git worktree add`. The DB
+				// member record proves we own `existing.worktreePath`, so rm is
+				// safe. Without this cleanup, retrying `git worktree add` aborts
+				// with `'<path>' already exists` (which doesn't match the
+				// stale-metadata prune-and-retry heuristics), the repo gets
+				// stuck in "failed", and planning never re-enters the adoption
+				// branch (that branch only fires when there is NO member record).
 				let hasStaleDir = false
 				try {
-					const dirStat = await stat(worktreePath)
+					const dirStat = await stat(existing.worktreePath)
 					if (dirStat.isDirectory()) hasStaleDir = true
 				} catch {
 					// Directory doesn't exist — retry will create fresh.
@@ -450,7 +470,7 @@ export async function planRepoWorktrees(
 				plans.push({
 					repo,
 					branch: existing.branch,
-					worktreePath,
+					worktreePath: existing.worktreePath,
 					action: "retry",
 					isOrphan: hasStaleDir,
 				})
@@ -490,6 +510,27 @@ export async function planRepoWorktrees(
 					.catch(() => false)
 
 				if (hasGitEntry && existingEntry?.branch) {
+					// FR-005 naming invariant: only adopt branches that look
+					// like they could have been produced by `computeBranchName`
+					// for THIS workspace. Adopting e.g. the user's `main` or a
+					// stale branch from a different workspace would break the
+					// `dev_*_{workspaceName}_{YYMMDD}` contract and confuse
+					// downstream tooling that keys off the `dev_` prefix.
+					const escapedName = workspaceName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+					const workspaceBranchPattern = new RegExp(
+						`^dev_.+_${escapedName}_\\d{6}$`,
+					)
+					if (!workspaceBranchPattern.test(existingEntry.branch)) {
+						planningFailures.push({
+							repoName: repo.name,
+							reason:
+								`target path ${worktreePath} is checked out on "${existingEntry.branch}", ` +
+								`which does not match the workspace branch naming scheme ` +
+								`dev_*_${workspaceName}_{YYMMDD} — refusing to adopt`,
+						})
+						continue
+					}
+
 					plans.push({
 						repo,
 						branch: existingEntry.branch,
@@ -633,40 +674,55 @@ async function executeSingleRepo(
 	const baseOutcome = { name: repo.name, worktreePath, branch }
 
 	try {
-		// Step 1: Remove known-stale directory before retrying.
-		// `isOrphan: true` is set ONLY by the planning phase when we have a
-		// persisted member record for this path — i.e. we created it on a
-		// previous run and it's now unhealthy. The critical round-4 contract
-		// still holds: the no-DB-record branch in `planRepoWorktrees` refuses
-		// to touch non-adoptable paths (emits a planning failure instead), so
-		// this rm only ever fires on paths we provably own.
-		if (isOrphan) {
-			log.info(`[workspace] Removing stale worktree directory: ${worktreePath}`)
-			await rm(worktreePath, { recursive: true, force: true })
-		}
+		// Decide whether we need to (re-)create the worktree. For "retry"
+		// plans we re-check health at execution time: if the worktree is
+		// still healthy (previous run's sync/hooks failed but the worktree
+		// itself is intact), skip rm + `git worktree add` entirely and go
+		// directly to sync/hooks. Removing a healthy worktree would destroy
+		// any user work-in-progress checked in between runs.
+		const needsAdd =
+			action === "create" ||
+			(action === "retry" && !(await isWorktreeHealthy(worktreePath, repo.path)))
 
-		// Step 2: git worktree add (with prune+retry on stale metadata — FR-008)
-		const needsNewBranch = !(await branchExists(repo.path, branch))
-		let wtResult = await createWorktree(repo.path, branch, worktreePath, needsNewBranch)
-
-		if (!wtResult.ok) {
-			// Check if this might be a stale metadata issue — prune and retry once
-			const errorLower = wtResult.error.toLowerCase()
-			const isStaleMetadata =
-				errorLower.includes("already locked") ||
-				errorLower.includes("already checked out") ||
-				errorLower.includes("is a missing but locked worktree")
-
-			if (isStaleMetadata) {
-				log.info(`[workspace] Pruning stale worktree metadata for ${repo.name}`)
-				await worktreePrune(repo.path)
-				// Retry once after prune
-				wtResult = await createWorktree(repo.path, branch, worktreePath, needsNewBranch)
+		if (needsAdd) {
+			// Step 1: Remove known-stale directory before retrying.
+			// `isOrphan: true` is set ONLY by the planning phase when we have
+			// a persisted member record for this path — i.e. we created it on
+			// a previous run and it's now unhealthy. The critical round-4
+			// contract still holds: the no-DB-record branch in
+			// `planRepoWorktrees` refuses to touch non-adoptable paths (emits
+			// a planning failure instead), so this rm only ever fires on
+			// paths we provably own AND know to be unhealthy.
+			if (isOrphan) {
+				log.info(`[workspace] Removing stale worktree directory: ${worktreePath}`)
+				await rm(worktreePath, { recursive: true, force: true })
 			}
+
+			// Step 2: git worktree add (with prune+retry on stale metadata — FR-008)
+			const needsNewBranch = !(await branchExists(repo.path, branch))
+			let wtResult = await createWorktree(repo.path, branch, worktreePath, needsNewBranch)
 
 			if (!wtResult.ok) {
-				return { ...baseOutcome, status: "failed", error: `git worktree add failed: ${wtResult.error}` }
+				// Check if this might be a stale metadata issue — prune and retry once
+				const errorLower = wtResult.error.toLowerCase()
+				const isStaleMetadata =
+					errorLower.includes("already locked") ||
+					errorLower.includes("already checked out") ||
+					errorLower.includes("is a missing but locked worktree")
+
+				if (isStaleMetadata) {
+					log.info(`[workspace] Pruning stale worktree metadata for ${repo.name}`)
+					await worktreePrune(repo.path)
+					// Retry once after prune
+					wtResult = await createWorktree(repo.path, branch, worktreePath, needsNewBranch)
+				}
+
+				if (!wtResult.ok) {
+					return { ...baseOutcome, status: "failed", error: `git worktree add failed: ${wtResult.error}` }
+				}
 			}
+		} else {
+			log.info(`[workspace] Worktree at ${worktreePath} is already healthy — re-running sync+hooks only`)
 		}
 
 		// Step 3: Load per-repo config
