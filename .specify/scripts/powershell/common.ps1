@@ -67,15 +67,18 @@ function Get-CurrentBranch {
         }
     }
 
-    # For non-git repos, try to find the latest feature directory
+    # For non-git repos, try to find the latest feature directory.
+    # -LiteralPath prevents checkouts with wildcard characters in the path
+    # (e.g. repo names containing `[`, `]`, `*`) from being interpreted as
+    # wildcards, which would silently fall through to the "main" fallback.
     $specsDir = Join-Path $repoRoot "specs"
-    
-    if (Test-Path $specsDir) {
+
+    if (Test-Path -LiteralPath $specsDir -PathType Container) {
         $latestFeature = ""
         $highest = 0
         $latestTimestamp = ""
 
-        Get-ChildItem -Path $specsDir -Directory | ForEach-Object {
+        Get-ChildItem -LiteralPath $specsDir -Directory | ForEach-Object {
             if ($_.Name -match '^(\d{8}-\d{6})-') {
                 # Timestamp-based branch: compare lexicographically
                 $ts = $matches[1]
@@ -180,22 +183,27 @@ function Get-FeaturePathsEnv {
 
 function Test-FileExists {
     param([string]$Path, [string]$Description)
-    if (Test-Path -Path $Path -PathType Leaf) {
-        Write-Output "  ✓ $Description"
+    # Write-Host (not Write-Output) — these helpers return $true/$false and the
+    # status line must stay off the success pipeline so boolean predicates like
+    # `if (-not (Test-FileExists ...))` don't see a truthy array. -LiteralPath
+    # handles repo checkouts under paths containing wildcard characters ([, *).
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        Write-Host "  ✓ $Description"
         return $true
     } else {
-        Write-Output "  ✗ $Description"
+        Write-Host "  ✗ $Description"
         return $false
     }
 }
 
 function Test-DirHasFiles {
     param([string]$Path, [string]$Description)
-    if ((Test-Path -Path $Path -PathType Container) -and (Get-ChildItem -Path $Path -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Select-Object -First 1)) {
-        Write-Output "  ✓ $Description"
+    # Same pipeline-pollution avoidance as Test-FileExists.
+    if ((Test-Path -LiteralPath $Path -PathType Container) -and (Get-ChildItem -LiteralPath $Path -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Select-Object -First 1)) {
+        Write-Host "  ✓ $Description"
         return $true
     } else {
-        Write-Output "  ✗ $Description"
+        Write-Host "  ✗ $Description"
         return $false
     }
 }
@@ -211,20 +219,23 @@ function Resolve-Template {
         [Parameter(Mandatory=$true)][string]$RepoRoot
     )
 
+    # All path lookups below use -LiteralPath so repo checkouts under paths
+    # containing wildcard characters (e.g. `repo[1]`) resolve correctly
+    # instead of being interpreted as wildcard patterns.
     $base = Join-Path $RepoRoot '.specify/templates'
 
     # Priority 1: Project overrides
     $override = Join-Path $base "overrides/$TemplateName.md"
-    if (Test-Path $override) { return $override }
+    if (Test-Path -LiteralPath $override -PathType Leaf) { return $override }
 
     # Priority 2: Installed presets (sorted by priority from .registry)
     $presetsDir = Join-Path $RepoRoot '.specify/presets'
-    if (Test-Path $presetsDir) {
+    if (Test-Path -LiteralPath $presetsDir -PathType Container) {
         $registryFile = Join-Path $presetsDir '.registry'
         $sortedPresets = @()
-        if (Test-Path $registryFile) {
+        if (Test-Path -LiteralPath $registryFile -PathType Leaf) {
             try {
-                $registryData = Get-Content $registryFile -Raw | ConvertFrom-Json
+                $registryData = Get-Content -LiteralPath $registryFile -Raw | ConvertFrom-Json
                 $presets = $registryData.presets
                 if ($presets) {
                     $sortedPresets = $presets.PSObject.Properties |
@@ -240,29 +251,29 @@ function Resolve-Template {
         if ($sortedPresets.Count -gt 0) {
             foreach ($presetId in $sortedPresets) {
                 $candidate = Join-Path $presetsDir "$presetId/templates/$TemplateName.md"
-                if (Test-Path $candidate) { return $candidate }
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
             }
         } else {
             # Fallback: alphabetical directory order
-            foreach ($preset in Get-ChildItem -Path $presetsDir -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '.*' }) {
+            foreach ($preset in Get-ChildItem -LiteralPath $presetsDir -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '.*' }) {
                 $candidate = Join-Path $preset.FullName "templates/$TemplateName.md"
-                if (Test-Path $candidate) { return $candidate }
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
             }
         }
     }
 
     # Priority 3: Extension-provided templates
     $extDir = Join-Path $RepoRoot '.specify/extensions'
-    if (Test-Path $extDir) {
-        foreach ($ext in Get-ChildItem -Path $extDir -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '.*' } | Sort-Object Name) {
+    if (Test-Path -LiteralPath $extDir -PathType Container) {
+        foreach ($ext in Get-ChildItem -LiteralPath $extDir -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '.*' } | Sort-Object Name) {
             $candidate = Join-Path $ext.FullName "templates/$TemplateName.md"
-            if (Test-Path $candidate) { return $candidate }
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
         }
     }
 
     # Priority 4: Core templates
     $core = Join-Path $base "$TemplateName.md"
-    if (Test-Path $core) { return $core }
+    if (Test-Path -LiteralPath $core -PathType Leaf) { return $core }
 
     return $null
 }

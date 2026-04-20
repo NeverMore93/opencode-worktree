@@ -17,7 +17,7 @@
  */
 
 import * as path from "node:path"
-import { rm, stat } from "node:fs/promises"
+import { stat } from "node:fs/promises"
 import type { OpencodeClient } from "../kdco-primitives/types"
 import type { Logger } from "./config"
 import { loadWorktreeConfig } from "./config"
@@ -418,15 +418,55 @@ export async function planRepoWorktrees(
 				})
 			}
 		} else {
-			// No existing member record — check for orphan directory
-			let isOrphan = false
+			// No existing member record — check if the target directory exists.
+			let dirExists = false
 			try {
 				const dirStat = await stat(worktreePath)
 				if (dirStat.isDirectory()) {
-					isOrphan = true
+					dirExists = true
 				}
 			} catch {
-				// Directory doesn't exist — clean create
+				// Directory doesn't exist — clean create path below.
+			}
+
+			if (dirExists) {
+				// The path already exists on disk but our DB has no record of it.
+				// Previously we classified this as an "orphan" and let the execution
+				// phase rm -rf the directory. That could silently destroy user
+				// files or a retained worktree with uncommitted changes whenever
+				// the directory happens not to be one we created.
+				//
+				// Instead, only adopt paths that are provably git worktrees we
+				// can reuse: they must have a `.git` entry AND appear in
+				// `git worktree list` for this repo. If either check fails we
+				// refuse to touch the directory and emit a planning failure so
+				// the user can resolve the conflict manually.
+				const entriesResult = await worktreeListDetailed(repo.path)
+				const entries = entriesResult.ok ? entriesResult.value : []
+				const normalizedWorktreePath = path.resolve(worktreePath)
+				const existingEntry = entries.find(
+					(entry) => path.resolve(entry.path) === normalizedWorktreePath,
+				)
+				const hasGitEntry = await stat(path.join(worktreePath, ".git"))
+					.then(() => true)
+					.catch(() => false)
+
+				if (hasGitEntry && existingEntry?.branch) {
+					plans.push({
+						repo,
+						branch: existingEntry.branch,
+						worktreePath,
+						action: "reuse",
+						isOrphan: false,
+					})
+					continue
+				}
+
+				planningFailures.push({
+					repoName: repo.name,
+					reason: `target path exists but is not an adoptable git worktree: ${worktreePath}`,
+				})
+				continue
 			}
 
 			// Compute branch name for new repos (fresh date)
@@ -450,8 +490,8 @@ export async function planRepoWorktrees(
 				repo,
 				branch,
 				worktreePath,
-				action: isOrphan ? "retry" : "create",
-				isOrphan,
+				action: "create",
+				isOrphan: false,
 			})
 		}
 	}
@@ -551,17 +591,15 @@ async function executeSingleRepo(
 	plan: RepoWorktreePlan,
 	log: Logger,
 ): Promise<MemberOutcome> {
-	const { repo, branch, worktreePath, action, isOrphan } = plan
+	const { repo, branch, worktreePath, action } = plan
 	const baseOutcome = { name: repo.name, worktreePath, branch }
 
 	try {
-		// Step 1: Remove orphan directory (FR-007)
-		if (isOrphan) {
-			log.info(`[workspace] Removing orphan directory: ${worktreePath}`)
-			await rm(worktreePath, { recursive: true, force: true })
-		}
-
-		// Step 2: git worktree add (with prune+retry on stale metadata — FR-008)
+		// Step 1: git worktree add (with prune+retry on stale metadata — FR-008).
+		// Note: the planning phase now refuses to destructively recover unknown
+		// directories at `worktreePath` — if a non-adoptable directory exists it
+		// surfaces as a planning failure before we ever reach execution. So this
+		// function never needs to rm -rf arbitrary paths.
 		const needsNewBranch = !(await branchExists(repo.path, branch))
 		let wtResult = await createWorktree(repo.path, branch, worktreePath, needsNewBranch)
 
@@ -657,26 +695,33 @@ export async function persistWorkspaceState(
 
 		const db = await getOrInitDb(repo.projectId, repo.path, client)
 
-		// Upsert workspace association (same for all repos in this workspace)
-		upsertWorkspaceAssociation(db, {
-			name: workspaceName,
-			workspacePath,
-			sessionId,
-			sessionDisposition,
-			sourceCwd,
-		})
+		// Wrap the two upserts in a single transaction so we never leave the
+		// DB with a session binding that has no member row. A partial commit
+		// would let the next reconcile misclassify the absent member as an
+		// orphan and potentially trigger destructive recovery.
+		// `db.transaction()` returns a callable that runs the body inside
+		// BEGIN/COMMIT and automatically ROLLBACKs if the body throws.
+		const persistRepo = db.transaction(() => {
+			upsertWorkspaceAssociation(db, {
+				name: workspaceName,
+				workspacePath,
+				sessionId,
+				sessionDisposition,
+				sourceCwd,
+			})
 
-		// Upsert workspace member with outcome
-		upsertWorkspaceMember(db, {
-			workspaceName,
-			workspacePath,
-			repoName: outcome.name,
-			projectId: repo.projectId,
-			branch: outcome.branch,
-			worktreePath: outcome.worktreePath,
-			status: outcome.status,
-			error: outcome.error ?? null,
+			upsertWorkspaceMember(db, {
+				workspaceName,
+				workspacePath,
+				repoName: outcome.name,
+				projectId: repo.projectId,
+				branch: outcome.branch,
+				worktreePath: outcome.worktreePath,
+				status: outcome.status,
+				error: outcome.error ?? null,
+			})
 		})
+		persistRepo()
 	}
 }
 
@@ -850,7 +895,17 @@ export async function orchestrateWorkspaceCreate(
 			client,
 			log,
 		)
-		const outcomes = [...executionOutcomes, ...preCheckFailureOutcomes, ...planningFailureOutcomes]
+
+		// Planning failures use `branch: ""` because we could not compute a
+		// safe branch name. That violates `workspaceMemberSchema`'s non-empty
+		// branch constraint, so they must never reach persistence — we keep
+		// them only in the response/outcome list.
+		// Pre-check failures inherit their branch from the plan, which is
+		// always a valid computed name, so they ARE safe to persist (each
+		// failed repo gets a `status="failed"` member record so the next
+		// reconcile run can pick them up).
+		const persistableOutcomes = [...executionOutcomes, ...preCheckFailureOutcomes]
+		const outcomes = [...persistableOutcomes, ...planningFailureOutcomes]
 
 		// ── Step 9: Resolve workspace session (FR-013, FR-014) ──────────
 		// Look up any existing stored session ID for this workspace. Must scan
@@ -902,13 +957,16 @@ export async function orchestrateWorkspaceCreate(
 		const session = sessionResult.value
 
 		// ── Step 10: Persist state (FR-023 — only after fork succeeded) ──
+		// Only persist `persistableOutcomes`. `planningFailureOutcomes`
+		// carry `branch: ""` which would fail `workspaceMemberSchema`
+		// validation (see Step 8 comment).
 		await persistWorkspaceState(
 			validName,
 			target.workspacePath,
 			cwd,
 			session.sessionId,
 			session.disposition,
-			outcomes,
+			persistableOutcomes,
 			target.repos,
 			client,
 		)
