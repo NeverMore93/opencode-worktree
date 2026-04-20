@@ -17,7 +17,7 @@
  */
 
 import * as path from "node:path"
-import { stat } from "node:fs/promises"
+import { rm, stat } from "node:fs/promises"
 import type { OpencodeClient } from "../kdco-primitives/types"
 import type { Logger } from "./config"
 import { loadWorktreeConfig } from "./config"
@@ -106,6 +106,26 @@ export interface CollisionError {
  *   repos continue.
  */
 export interface PreCheckFailure {
+	readonly repoName: string
+	/**
+	 * Planned branch for this repo. Always populated because pre-check only
+	 * runs over `plans`, so every failure has a corresponding successful plan.
+	 * Carrying it on the failure lets the orchestrator synthesize a
+	 * schema-valid MemberOutcome without having to re-query the plan list.
+	 */
+	readonly branch: string
+	/** Planned worktree path for this repo (same rationale as `branch`). */
+	readonly worktreePath: string
+	readonly reason: string
+}
+
+/**
+ * Failure emitted by the planning phase, BEFORE a plan exists. Distinct from
+ * {@link PreCheckFailure} because no branch/worktree path has been computed —
+ * that's exactly why planning failed. These outcomes are response-only and
+ * MUST NOT reach persistence (see orchestrator Step 8 comment).
+ */
+export interface PlanningFailure {
 	readonly repoName: string
 	readonly reason: string
 }
@@ -265,6 +285,8 @@ export async function checkBranchCollisions(
 			if (!result.ok) {
 				preCheckFailures.push({
 					repoName: plan.repo.name,
+					branch: plan.branch,
+					worktreePath: plan.worktreePath,
 					reason: `pre-check failed: ${result.error}`,
 				})
 				failedRepoRoots.add(repoRoot)
@@ -378,7 +400,7 @@ async function isWorktreeHealthy(
  */
 export interface PlanningOutcome {
 	readonly plans: RepoWorktreePlan[]
-	readonly planningFailures: PreCheckFailure[]
+	readonly planningFailures: PlanningFailure[]
 }
 
 export async function planRepoWorktrees(
@@ -388,7 +410,7 @@ export async function planRepoWorktrees(
 	existingMembers: Map<string, WorkspaceMember>,
 ): Promise<PlanningOutcome> {
 	const plans: RepoWorktreePlan[] = []
-	const planningFailures: PreCheckFailure[] = []
+	const planningFailures: PlanningFailure[] = []
 
 	for (const repo of repos) {
 		const worktreePath = path.join(workspacePath, repo.name)
@@ -408,13 +430,29 @@ export async function planRepoWorktrees(
 					isOrphan: false,
 				})
 			} else {
-				// Unhealthy or previously failed → retry with stored branch name
+				// Unhealthy or previously failed → retry with stored branch name.
+				// If a directory still exists at `worktreePath`, it's a stale
+				// artifact from our previous failed run — the DB member record
+				// proves we own this path, so it's safe to rm before retrying.
+				// Without this cleanup, `git worktree add` aborts with
+				// `'<path>' already exists` (which doesn't match the
+				// stale-metadata prune-and-retry heuristics), the repo is
+				// permanently stuck in "failed", and planning never re-enters
+				// the adoption branch (that branch only fires when there is
+				// NO member record).
+				let hasStaleDir = false
+				try {
+					const dirStat = await stat(worktreePath)
+					if (dirStat.isDirectory()) hasStaleDir = true
+				} catch {
+					// Directory doesn't exist — retry will create fresh.
+				}
 				plans.push({
 					repo,
 					branch: existing.branch,
 					worktreePath,
 					action: "retry",
-					isOrphan: false,
+					isOrphan: hasStaleDir,
 				})
 			}
 		} else {
@@ -591,15 +629,23 @@ async function executeSingleRepo(
 	plan: RepoWorktreePlan,
 	log: Logger,
 ): Promise<MemberOutcome> {
-	const { repo, branch, worktreePath, action } = plan
+	const { repo, branch, worktreePath, action, isOrphan } = plan
 	const baseOutcome = { name: repo.name, worktreePath, branch }
 
 	try {
-		// Step 1: git worktree add (with prune+retry on stale metadata — FR-008).
-		// Note: the planning phase now refuses to destructively recover unknown
-		// directories at `worktreePath` — if a non-adoptable directory exists it
-		// surfaces as a planning failure before we ever reach execution. So this
-		// function never needs to rm -rf arbitrary paths.
+		// Step 1: Remove known-stale directory before retrying.
+		// `isOrphan: true` is set ONLY by the planning phase when we have a
+		// persisted member record for this path — i.e. we created it on a
+		// previous run and it's now unhealthy. The critical round-4 contract
+		// still holds: the no-DB-record branch in `planRepoWorktrees` refuses
+		// to touch non-adoptable paths (emits a planning failure instead), so
+		// this rm only ever fires on paths we provably own.
+		if (isOrphan) {
+			log.info(`[workspace] Removing stale worktree directory: ${worktreePath}`)
+			await rm(worktreePath, { recursive: true, force: true })
+		}
+
+		// Step 2: git worktree add (with prune+retry on stale metadata — FR-008)
 		const needsNewBranch = !(await branchExists(repo.path, branch))
 		let wtResult = await createWorktree(repo.path, branch, worktreePath, needsNewBranch)
 
@@ -874,18 +920,19 @@ export async function orchestrateWorkspaceCreate(
 		// FR-009 case (b) — pre-check failed for individual repos = per-repo
 		// `status="failed"`, those repos are excluded from execution but the
 		// rest continue. Synthesize MemberOutcomes for the failed repos so
-		// they appear in the response alongside execution results.
+		// they appear in the response alongside execution results. branch
+		// and worktreePath come directly from the PreCheckFailure — they
+		// were populated from the plan at push-time, so there is no need
+		// for a defensive `?? ""` fallback that could inject an invalid
+		// empty branch into the persistence Zod schema.
 		const preCheckFailedNames = new Set(preCheck.preCheckFailures.map((f) => f.repoName))
-		const preCheckFailureOutcomes: MemberOutcome[] = preCheck.preCheckFailures.map((failure) => {
-			const failedPlan = plans.find((p) => p.repo.name === failure.repoName)
-			return {
-				name: failure.repoName,
-				worktreePath: failedPlan?.worktreePath ?? path.join(target.workspacePath, failure.repoName),
-				branch: failedPlan?.branch ?? "",
-				status: "failed" as const,
-				error: failure.reason,
-			}
-		})
+		const preCheckFailureOutcomes: MemberOutcome[] = preCheck.preCheckFailures.map((failure) => ({
+			name: failure.repoName,
+			worktreePath: failure.worktreePath,
+			branch: failure.branch,
+			status: "failed" as const,
+			error: failure.reason,
+		}))
 
 		// ── Step 8: Execute worktree creation (skip pre-check failures) ─
 		const plansToExecute = plans.filter((p) => !preCheckFailedNames.has(p.repo.name))
