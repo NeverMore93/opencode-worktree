@@ -214,7 +214,7 @@ Workspace membership is reconstructed by: (1) auto-detecting repos in `<cwd>`, (
 
 ### `/dev <name>` — First Run
 
-```
+```text
 User invokes /dev prd_1
 │
 ├─ 1. validateWorkspaceName("prd_1")                    [workspace.ts]
@@ -249,7 +249,7 @@ User invokes /dev prd_1
 
 ### `/dev <name>` — Reconcile Run
 
-```
+```text
 User invokes /dev prd_1 (existing workspace)
 │
 ├─ Steps 1–4: Same as first run
@@ -272,7 +272,7 @@ User invokes /dev prd_1 (existing workspace)
 
 ### `worktree_create` with `headless: true` (US3)
 
-```
+```text
 SDK calls worktree_create({ branch, headless: true, repoPath })
 │
 ├─ Resolve repo root from repoPath                     [workspace.ts]

@@ -359,13 +359,30 @@ async function isWorktreeHealthy(
  * @param existingMembers - Previously persisted members keyed by projectId
  * @returns Ordered array of plans, one per repo
  */
+/**
+ * Output of `planRepoWorktrees`: the plans to execute plus per-repo planning
+ * failures (analogous to {@link PreCheckOutcome.preCheckFailures}).
+ *
+ * Planning failures are repos we refuse to mutate because we cannot even
+ * compute a safe plan — typically `git rev-parse HEAD` failed, so we don't
+ * know what base branch to derive the workspace branch from. Creating a
+ * placeholder like `dev_unknown_*` would silently produce the wrong branch,
+ * so the orchestrator treats these as `status="failed"` and excludes them
+ * from execution, the same way it handles confirmed pre-check failures.
+ */
+export interface PlanningOutcome {
+	readonly plans: RepoWorktreePlan[]
+	readonly planningFailures: PreCheckFailure[]
+}
+
 export async function planRepoWorktrees(
 	repos: DetectedRepo[],
 	workspacePath: string,
 	workspaceName: string,
 	existingMembers: Map<string, WorkspaceMember>,
-): Promise<RepoWorktreePlan[]> {
+): Promise<PlanningOutcome> {
 	const plans: RepoWorktreePlan[] = []
+	const planningFailures: PreCheckFailure[] = []
 
 	for (const repo of repos) {
 		const worktreePath = path.join(workspacePath, repo.name)
@@ -409,14 +426,14 @@ export async function planRepoWorktrees(
 			// Compute branch name for new repos (fresh date)
 			const baseBranchResult = await resolveBaseBranch(repo.path)
 			if (!baseBranchResult.ok) {
-				// Cannot resolve HEAD — plan as create but with a fallback branch
-				// The execution phase will handle the failure.
-				plans.push({
-					repo,
-					branch: computeBranchName("unknown", workspaceName),
-					worktreePath,
-					action: isOrphan ? "retry" : "create",
-					isOrphan,
+				// Cannot resolve HEAD — don't try to plan a worktree we can't name
+				// correctly. Record as a planning failure so the orchestrator
+				// surfaces it as `status="failed"` for this repo and skips it
+				// from mutation. Fabricating `dev_unknown_*` would create a
+				// silently-wrong branch on the source repo.
+				planningFailures.push({
+					repoName: repo.name,
+					reason: `failed to resolve HEAD for base branch: ${baseBranchResult.error}`,
 				})
 				continue
 			}
@@ -433,7 +450,7 @@ export async function planRepoWorktrees(
 		}
 	}
 
-	return plans
+	return { plans, planningFailures }
 }
 
 // =============================================================================
@@ -774,12 +791,23 @@ export async function orchestrateWorkspaceCreate(
 		}
 
 		// ── Step 6: Plan repo worktrees ─────────────────────────────────
-		const plans = await planRepoWorktrees(
+		const planning = await planRepoWorktrees(
 			target.repos,
 			target.workspacePath,
 			validName,
 			existingMembers,
 		)
+		const plans = planning.plans
+
+		// Planning failures (e.g. HEAD unresolvable) surface as per-repo
+		// `status="failed"` outcomes and are excluded from subsequent mutation.
+		const planningFailureOutcomes: MemberOutcome[] = planning.planningFailures.map((failure) => ({
+			name: failure.repoName,
+			worktreePath: path.join(target.workspacePath, failure.repoName),
+			branch: "",
+			status: "failed" as const,
+			error: failure.reason,
+		}))
 
 		// ── Step 7: Branch collision pre-check (FR-009 dual-path) ───────
 		const preCheck = await checkBranchCollisions(plans, target.workspacePath)
@@ -816,22 +844,26 @@ export async function orchestrateWorkspaceCreate(
 			client,
 			log,
 		)
-		const outcomes = [...executionOutcomes, ...preCheckFailureOutcomes]
+		const outcomes = [...executionOutcomes, ...preCheckFailureOutcomes, ...planningFailureOutcomes]
 
 		// ── Step 9: Resolve workspace session (FR-013, FR-014) ──────────
-		// Look up any existing stored session ID for this workspace
+		// Look up any existing stored session ID for this workspace. Must scan
+		// every member repo's DB: if we only inspected the first repo, a
+		// newly-added repo (no association yet) at index 0 would make us fork
+		// a second workspace-level session even though a sibling repo's DB
+		// already holds the valid binding — violating FR-013's "exactly one
+		// workspace-level session" invariant.
 		let storedSessionId: string | undefined
-		// Use the first repo's DB to find the stored association
-		if (target.repos.length > 0) {
+		for (const repo of target.repos) {
 			try {
-				const firstRepo = target.repos[0]
-				const db = await getOrInitDb(firstRepo.projectId, firstRepo.path, client)
+				const db = await getOrInitDb(repo.projectId, repo.path, client)
 				const assoc = getWorkspaceAssociation(db, validName, target.workspacePath)
 				if (assoc?.sessionId) {
 					storedSessionId = assoc.sessionId
+					break
 				}
 			} catch {
-				// Non-fatal — will just fork a new session
+				// Non-fatal — skip this repo and keep scanning the others.
 			}
 		}
 

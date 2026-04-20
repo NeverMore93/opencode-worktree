@@ -108,7 +108,7 @@ const workspaceAssociationSchema = z.object({
 	name: z.string().min(1),
 	workspacePath: z.string().min(1),
 	sessionId: z.string().nullable(),
-	sessionDisposition: z.string().nullable(),
+	sessionDisposition: z.enum(["forked", "reused"]).nullable(),
 	sourceCwd: z.string().min(1),
 	createdAt: z.string().min(1),
 	updatedAt: z.string().min(1),

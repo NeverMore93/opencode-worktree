@@ -71,18 +71,26 @@ if (-not $commandFiles) {
     throw "No speckit command files found in $SourceDir"
 }
 
-New-Item -ItemType Directory -Path $DestRoot -Force | Out-Null
+New-Item -ItemType Directory -LiteralPath $DestRoot -Force | Out-Null
 
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 $installed = New-Object System.Collections.Generic.List[string]
 
 foreach ($commandFile in $commandFiles) {
     $parsed = Parse-CommandFile -Path $commandFile.FullName
+    # Skip command files whose body is empty — writing a SKILL.md with only
+    # frontmatter produces an unusable skill entry and masks upstream parse
+    # issues. The user can rerun after fixing the source command file.
+    if ([string]::IsNullOrWhiteSpace($parsed.Body)) {
+        Write-Warning "Skipping $($commandFile.Name): body is empty after frontmatter"
+        continue
+    }
+
     $skillName = $commandFile.BaseName -replace '\.', '-'
     $skillDir = Join-Path $DestRoot $skillName
     $skillPath = Join-Path $skillDir "SKILL.md"
 
-    New-Item -ItemType Directory -Path $skillDir -Force | Out-Null
+    New-Item -ItemType Directory -LiteralPath $skillDir -Force | Out-Null
 
     $content = @(
         "---"

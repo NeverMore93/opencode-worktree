@@ -140,8 +140,13 @@ function Test-FeatureBranch {
     }
     
     if ($Branch -notmatch '^[0-9]{3}-' -and $Branch -notmatch '^\d{8}-\d{6}-') {
-        Write-Output "ERROR: Not on a feature branch. Current branch: $Branch"
-        Write-Output "Feature branches should be named like: 001-feature-name or 20260319-143022-feature-name"
+        # Use Write-Error (stderr stream) so the function's return value stays
+        # a clean boolean. Writing to the success stream here would cause
+        # `(Test-FeatureBranch ...)` to return an array like
+        # @("ERROR:...", "Feature branches...", $false), and `-not <array>`
+        # evaluates to $false for any non-empty array — silently swallowing
+        # the failure in callers that do `if (-not (Test-FeatureBranch ...))`.
+        Write-Error "Not on a feature branch. Current branch: $Branch. Feature branches should be named like: 001-feature-name or 20260319-143022-feature-name" -ErrorAction Continue
         return $false
     }
     return $true
