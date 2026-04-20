@@ -225,9 +225,9 @@ interface WorktreeEntry {
  * @param repoRoot - Absolute path to the repository root
  * @returns Array of WorktreeEntry (includes the main worktree)
  */
-async function worktreeListDetailed(repoRoot: string): Promise<WorktreeEntry[]> {
+async function worktreeListDetailed(repoRoot: string): Promise<Result<WorktreeEntry[], string>> {
 	const result = await git(["worktree", "list", "--porcelain"], repoRoot)
-	if (!result.ok) return []
+	if (!result.ok) return Result.err(result.error)
 
 	const entries: WorktreeEntry[] = []
 	let currentPath: string | null = null
@@ -253,7 +253,7 @@ async function worktreeListDetailed(repoRoot: string): Promise<WorktreeEntry[]> 
 		entries.push({ path: currentPath, branch: currentBranch })
 	}
 
-	return entries
+	return Result.ok(entries)
 }
 
 // =============================================================================

@@ -24,6 +24,7 @@ import { loadWorktreeConfig } from "./config"
 import {
 	type Result,
 	Result as R,
+	type WorktreeEntry,
 	branchExists,
 	createWorktree,
 	git,
@@ -210,9 +211,9 @@ async function resolveBaseBranch(repoPath: string): Promise<Result<string, strin
  *       FR-009 mandates per-repo `status="failed"` and exclusion from
  *       subsequent steps for that repo only; other repos continue.
  *
- * The function never throws on a per-repo `worktreeListDetailed` failure —
- * the failure is captured into `preCheckFailures` and the rest of the
- * pre-check continues so all repos get evaluated.
+ * `worktreeListDetailed` surfaces git errors via its `Result` return (not
+ * throws), so those failures are captured into `preCheckFailures` and the
+ * rest of the pre-check continues so all repos get evaluated.
  *
  * @param plans         Planned repo worktree actions (only "create" and
  *                      "retry" plans require pre-check; "reuse" already
@@ -240,7 +241,7 @@ export async function checkBranchCollisions(
 	// Collect all worktree entries per unique repo root (dedup in case
 	// multiple plans reference the same repo root — shouldn't happen but
 	// defensive).
-	const worktreeCache = new Map<string, Awaited<ReturnType<typeof worktreeListDetailed>>>()
+	const worktreeCache = new Map<string, WorktreeEntry[]>()
 	// Repo roots whose pre-check has already failed; skip subsequent plans
 	// referencing the same repo to avoid duplicate failure entries.
 	const failedRepoRoots = new Set<string>()
@@ -254,21 +255,22 @@ export async function checkBranchCollisions(
 		if (failedRepoRoots.has(repoRoot)) continue
 
 		// Fetch detailed worktree list (cached per repo root). On failure,
-		// record it as a per-repo PreCheckFailure rather than throwing —
-		// FR-009 case (b) requires this repo to be marked failed without
-		// aborting the whole pre-check.
+		// record it as a per-repo PreCheckFailure rather than silently
+		// treating the repo as collision-free — FR-009 case (b) requires
+		// this repo to be marked failed without aborting the whole
+		// pre-check. `worktreeListDetailed` returns Result, not throws, so
+		// the error surfaces via result.ok rather than try/catch.
 		if (!worktreeCache.has(repoRoot)) {
-			try {
-				worktreeCache.set(repoRoot, await worktreeListDetailed(repoRoot))
-			} catch (error) {
-				const reason = error instanceof Error ? error.message : String(error)
+			const result = await worktreeListDetailed(repoRoot)
+			if (!result.ok) {
 				preCheckFailures.push({
 					repoName: plan.repo.name,
-					reason: `pre-check failed: ${reason}`,
+					reason: `pre-check failed: ${result.error}`,
 				})
 				failedRepoRoots.add(repoRoot)
 				continue
 			}
+			worktreeCache.set(repoRoot, result.value)
 		}
 		const entries = worktreeCache.get(repoRoot)!
 
@@ -327,9 +329,13 @@ async function isWorktreeHealthy(
 	}
 
 	// (c) Is the path listed in `git worktree list`?
-	const entries = await worktreeListDetailed(repoPath)
+	// If git fails (e.g. repo corrupted or binary missing), treat the
+	// worktree as unhealthy — the reconcile path will then retry via
+	// `git worktree add` which will surface the underlying error.
+	const result = await worktreeListDetailed(repoPath)
+	if (!result.ok) return false
 	const normalizedTarget = path.resolve(worktreePath)
-	return entries.some((entry) => path.resolve(entry.path) === normalizedTarget)
+	return result.value.some((entry) => path.resolve(entry.path) === normalizedTarget)
 }
 
 // =============================================================================
