@@ -161,16 +161,21 @@ export async function runHooks(
 		log.info(`[worktree] Running hook: ${command}`)
 		try {
 			const executeHook = async (): Promise<void> => {
-				// Use shell to properly handle quoted arguments and complex commands
-				const result = Bun.spawnSync(["bash", "-c", command], {
+				// Use shell to properly handle quoted arguments and complex commands.
+				// Use async Bun.spawn (not spawnSync) so long-running hooks like
+				// `pnpm install` do not block the Bun event loop — other plugin
+				// operations (session events, concurrent repo hooks under
+				// FR-023 parallel phase) need to progress during hook execution.
+				const proc = Bun.spawn(["bash", "-c", command], {
 					cwd,
 					stdout: "inherit",
 					stderr: "pipe",
 				})
-				if (result.exitCode !== 0) {
-					const stderr = result.stderr?.toString() || ""
+				const exitCode = await proc.exited
+				if (exitCode !== 0) {
+					const stderr = proc.stderr ? await new Response(proc.stderr).text() : ""
 					throw new Error(
-						`Hook failed (exit ${result.exitCode}): ${command}${stderr ? `\n${stderr}` : ""}`,
+						`Hook failed (exit ${exitCode}): ${command}${stderr ? `\n${stderr}` : ""}`,
 					)
 				}
 			}
