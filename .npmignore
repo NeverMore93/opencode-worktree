@@ -1,0 +1,29 @@
+# Source
+src/
+
+# Tests
+tests/
+
+# Specs and design docs
+specs/
+.specify/
+
+# Agent/skill directories
+.agents/
+.claude/
+
+# GitHub workflows
+.github/
+
+# Project config
+AGENTS.md
+CLAUDE.md
+tsconfig.json
+tsup.config.ts
+bun.lock
+bun.lockb
+
+# IDE
+.idea/
+.vscode/
+.cursor/
