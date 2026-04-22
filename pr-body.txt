@@ -1,0 +1,23 @@
+## Summary
+
+Prepare the fork for independent npm publishing by updating package metadata and project configuration.
+
+## Changes
+
+- **package.json**: Rename from `@opencode-ai/plugin-worktree` to `opencode-worktree` to avoid npm scope conflict
+  - Added `exports` field for ESM best practice
+  - Added `author`, `homepage`, `repository` pointing to fork
+  - Moved runtime deps (`jsonc-parser`, `zod`) to top-level `dependencies`
+  - Added `opencode-plugin` and `multi-repo` keywords
+- **.gitignore**: Expanded to production standard (node_modules, dist, env, IDE, OS, spec/agent state)
+- **CLAUDE.md**: Replaced repository-ownership guidelines with project-specific coding guidelines (Think Before Coding, Simplicity First, Surgical Changes, Goal-Driven Execution)
+
+## Test Plan
+
+- `npm run build` — verify tsup builds successfully
+- `npm run typecheck` — verify TypeScript compiles without errors
+- `npm publish --dry-run` — verify package can be published (no scope conflict)
+
+## Root Cause
+
+The original `@opencode-ai/plugin-worktree` name requires npm org membership to publish. Since this is a fork for independent publishing, we need a non-scoped or own-scope package name.

@@ -1,1 +1,35 @@
-/.idea/
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment
+.env*
+
+# IDE
+.idea/
+.vscode/
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Bun
+bun.lockb
+
+# Package archives
+*.tgz
+
+# Coverage
+coverage/
+
+# Logs
+logs/
+
+# SpecKit / Agent state (tracked separately)
+.specify/
+.agents/
+.claude/
+specs/
