@@ -1,5 +1,7 @@
 # opencode-worktree
 
+[![npm](https://img.shields.io/npm/v/@nevermore93/opencode-worktree)](https://www.npmjs.com/package/@nevermore93/opencode-worktree)
+
 > Git worktrees that spawn their own terminal. Multi-repo workspaces that orchestrate themselves. Zero-friction isolation for AI-driven development.
 
 An [OpenCode](https://github.com/sst/opencode) plugin that creates isolated git worktrees—single-repo with automatic terminal spawning, or multi-repo workspaces that mirror your directory layout. No manual setup, no context switching, no cleanup work.
