@@ -1,7 +1,7 @@
 import { defineConfig } from "tsup";
 
 export default defineConfig({
-  entry: ["src/plugin/worktree.ts"],
+  entry: { "plugin/worktree": "src/plugin/worktree.ts" },
   format: ["esm"],
   target: "node20",
   sourcemap: true,
