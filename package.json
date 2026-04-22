@@ -1,6 +1,6 @@
 {
   "name": "opencode-worktree",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenCode plugin for multi-repo workspace worktree orchestration",
   "type": "module",
   "main": "dist/plugin/worktree.js",
