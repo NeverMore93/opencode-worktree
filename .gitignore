@@ -33,3 +33,5 @@ logs/
 .agents/
 .claude/
 specs/
+
+doc
